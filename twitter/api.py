@@ -8,6 +8,8 @@ except ImportError:
 from twitter.twitter_globals import POST_ACTIONS
 from twitter.auth import NoAuth
 
+import urllib3
+
 try:
     import json
 except ImportError:
@@ -15,6 +17,21 @@ except ImportError:
 
 class _DEFAULT(object):
     pass
+
+class SingularHttpPool():
+  
+  def __init__(self):
+    self.host = 'api.twitter.com'
+    self.http_pool = None
+
+  def get_http_pool(self):
+    if self.http_pool is None:
+      self.http_pool = urllib3.HTTPConnectionPool(self.host)
+    return self.http_pool
+
+
+singularPool = SingularHttpPool()
+
 
 class TwitterError(Exception):
     """
@@ -59,14 +76,16 @@ class TwitterResponse(object):
         """
         Remaining requests in the current rate-limit.
         """
-        return int(self.headers.getheader('X-RateLimit-Remaining'))
+        #return int(self.headers.getheader('X-RateLimit-Remaining'))
+        return int(self.headers.getheader('x-ratelimit-remaining'))
 
     @property
     def rate_limit_reset(self):
         """
         Time in UTC epoch seconds when the rate limit will reset.
         """
-        return int(self.headers.getheader('X-RateLimit-Reset'))
+        #return int(self.headers.getheader('X-RateLimit-Reset'))
+        return int(self.headers.getheader('x-ratelimit-reset'))
 
 
 def wrap_response(response, headers):
@@ -99,6 +118,7 @@ class TwitterCall(object):
         self.uri = uri
         self.uriparts = uriparts
         self.secure = secure
+        self.http_pool = singularPool.get_http_pool()
 
     def __getattr__(self, k):
         try:
@@ -106,8 +126,8 @@ class TwitterCall(object):
         except AttributeError:
             return self.callable_cls(
                 auth=self.auth, format=self.format, domain=self.domain,
-                callable_cls=self.callable_cls, uriparts=self.uriparts + (k,),
-                secure=self.secure)
+                callable_cls=self.callable_cls, 
+                uriparts=self.uriparts + (k,), secure=self.secure)
 
     def __call__(self, **kwargs):
         # Build the uri.
@@ -136,8 +156,10 @@ class TwitterCall(object):
         dot = ""
         if self.format:
             dot = "."
-        uriBase = "http%s://%s/%s%s%s" %(
-                    secure_str, self.domain, uri, dot, self.format)
+        #uriBase = "http%s://%s/%s%s%s" %(
+        #            secure_str, self.domain, uri, dot, self.format)
+        uriBase = "http://%s/%s%s%s" %(
+                            self.domain, uri, dot, self.format)
 
         headers = {}
         if self.auth:
@@ -148,20 +170,37 @@ class TwitterCall(object):
                 body = None
             else:
                 body = arg_data.encode('utf8')
-
+        
+        #uriBase: http://api.twitter.com/1/statuses...
+        #body: None
+        #headers: {}
         req = urllib_request.Request(uriBase, body, headers)
-        return self._handle_response(req, uri, arg_data)
+        #req = ""
+        return self._handle_response(req, uri, arg_data, uriBase)
 
-    def _handle_response(self, req, uri, arg_data):
+    def _handle_response(self, req, uri, arg_data, uriBase):
         try:
-            handle = urllib_request.urlopen(req)
+            flag = False
+            r = self.http_pool.urlopen('GET', uriBase)
+            try:
+              json_result = json.loads(r.data.decode('utf8'))
+            except ValueError:
+              return []
+            
+            if r.status not in (200,304):
+                flag = True
+                raise urllib3.HTTPError(r.status)
+
             if "json" == self.format:
-                res = json.loads(handle.read().decode('utf8'))
-                return wrap_response(res, handle.headers)
+                return wrap_response(json_result, r.headers)
             else:
                 return wrap_response(
-                    handle.read().decode('utf8'), handle.headers)
-        except urllib_error.HTTPError as e:
+                    r.data.decode('utf8'), r.headers)
+
+        except urllib3.HTTPError as e:
+            if flag:
+              e.code = r.status
+
             if (e.code == 304):
                 return []
             else:
